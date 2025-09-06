@@ -1,11 +1,10 @@
-// server.js
 import fs from "fs/promises";
 import express from "express";
 import cors from "cors";
 import dotenv from "dotenv";
 import fetch from "node-fetch";
 import path from "path";
-import { getQueryEmbedding } from "./embeddingClient.js"; // local embeddings
+import { getQueryEmbedding } from "./embeddingClient.js";
 import { search } from "./search.js";
 
 dotenv.config();
@@ -46,9 +45,7 @@ await loadKB();
 
 // -------------------- Cosine similarity --------------------
 function cosineSimilarity(a, b) {
-  let dot = 0,
-    na = 0,
-    nb = 0;
+  let dot = 0, na = 0, nb = 0;
   for (let i = 0; i < a.length; i++) {
     dot += a[i] * b[i];
     na += a[i] * a[i];
@@ -64,16 +61,17 @@ async function retrieveTopK(query, k = 3) {
 
   return results.map(r => {
     const kbPage = kb.find(p => p.page_number === r.page_number);
-
-    let relevantImages = (kbPage?.images ?? []).filter(img => {
-      if (!img.embedding) return false;
-      const imgEmb = Array.isArray(img.embedding[0])
-        ? img.embedding.flat(Infinity)
-        : img.embedding;
-      if (imgEmb.length !== qEmb.length) return false;
-      const sim = cosineSimilarity(qEmb, imgEmb);
-      return sim > 0.2;
-    });
+    
+    let relevantImages = [];
+    if (kbPage?.images && kbPage.images.length > 0) {
+      relevantImages = kbPage.images.filter(img => {
+        if (!img.embedding || img.embedding.length === 0) return false;
+        const imgEmb = img.embedding;
+        const sim = cosineSimilarity(qEmb, imgEmb);
+        if (sim > 0.1) console.log(`📸 Image "${img.filename}" similarity: ${sim.toFixed(4)}`);
+        return sim > 0.15;
+      });
+    }
 
     return {
       ...r,
@@ -82,15 +80,34 @@ async function retrieveTopK(query, k = 3) {
   });
 }
 
+// -------------------- Helper: Summarize KB --------------------
+async function summarizeContext(topResults) {
+  const texts = topResults.map(c => c.text).join("\n---\n");
+  const res = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${OPENROUTER_KEY}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      model: "openai/gpt-oss-20b:free",
+      messages: [
+        { role: "system", content: "You are a helpful assistant. Summarize the following content concisely for answering a question." },
+        { role: "user", content: texts }
+      ],
+    }),
+  });
+  const data = await res.json();
+  return data.choices?.[0]?.message?.content || texts;
+}
+
 // -------------------- Chat endpoint (POST) --------------------
 app.post("/chat", async (req, res) => {
   try {
     const userQuery = req.body.message?.trim();
     if (!userQuery) return res.status(400).json({ error: "message required" });
 
-    const wantsImage = /image|diagram|picture|visual|figure/i.test(userQuery);
-
-    // Small talk detection
+    const wantsImage = /image|diagram|picture|visual|figure|screenshot|photo|illustration|chart|graph|drawing/i.test(userQuery);
     const smallTalkRegex = /\b(hi|hello|hey|how are you|good morning|good afternoon|good evening)\b/i;
     const isSmallTalk = smallTalkRegex.test(userQuery);
 
@@ -98,28 +115,39 @@ app.post("/chat", async (req, res) => {
     let topResults = [];
 
     if (isSmallTalk) {
-      const chatRes = await fetch("https://openrouter.ai/api/v1/chat/completions", {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${OPENROUTER_KEY}`,
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-          model: "openai/gpt-oss-20b:free",
-          messages: [
-            { role: "system", content: "You are a friendly assistant." },
-            { role: "user", content: userQuery },
-          ],
-        }),
-      });
-      const chatData = await chatRes.json();
-      answer = chatData.choices?.[0]?.message?.content || "Hello!";
+      const greetings = ["Hey! 👋","Hello! 😊","Hi there!","Hey, how's it going?","Hi! Hope you're doing well!"];
+      answer = greetings[Math.floor(Math.random() * greetings.length)];
     } else {
       topResults = await retrieveTopK(userQuery, 3);
       const KB_THRESHOLD = 0.05;
 
-      if (!wantsImage && topResults[0]?.score >= KB_THRESHOLD) {
-        const contextText = topResults.map(c => c.text).join("\n---\n");
+      if (wantsImage) {
+        const wordCount = userQuery.split(/\s+/).length;
+        const isGenericRequest = /(show|see|give).*(image|picture|diagram)/i.test(userQuery) && wordCount <= 4;
+        if (isGenericRequest) {
+          answer = "I'd be happy to show you images! Could you be more specific?";
+          res.json({ reply: answer, query: userQuery, images: [], top_results: [] });
+          return;
+        }
+
+        if (topResults[0]?.score >= KB_THRESHOLD) {
+          const allImages = topResults.flatMap(r =>
+            r.images.map(img => ({ filename: img.filename, url: img.url.replace(/^\/uploads\/images/, "/images"), width: img.width, height: img.height }))
+          );
+          if (allImages.length > 0) {
+            answer = `I found ${allImages.length} relevant image(s) for "${userQuery}"`;
+            res.json({ reply: answer, query: userQuery, images: allImages });
+            return;
+          }
+        }
+
+        answer = "Couldn't find any relevant images in the knowledge base.";
+        res.json({ reply: answer, query: userQuery, images: [] });
+        return;
+      }
+
+      if (topResults[0]?.score >= KB_THRESHOLD) {
+        const summaryText = await summarizeContext(topResults);
         const chatRes = await fetch("https://openrouter.ai/api/v1/chat/completions", {
           method: "POST",
           headers: {
@@ -129,8 +157,8 @@ app.post("/chat", async (req, res) => {
           body: JSON.stringify({
             model: "openai/gpt-oss-20b:free",
             messages: [
-              { role: "system", content: "You are a helpful assistant." },
-              { role: "user", content: `Context:\n${contextText}\n\nQuestion:\n${userQuery}` },
+              { role: "system", content: "You are a helpful assistant. Give concise answers." },
+              { role: "user", content: `Summary:\n${summaryText}\n\nQuestion:\n${userQuery}` },
             ],
           }),
         });
@@ -138,17 +166,6 @@ app.post("/chat", async (req, res) => {
         answer = chatData.choices?.[0]?.message?.content || answer;
       }
     }
-
-    const images = wantsImage
-      ? topResults.flatMap(r =>
-          r.images.map(img => ({
-            filename: img.filename,
-            url: img.url,
-            width: img.width,
-            height: img.height,
-          }))
-        )
-      : [];
 
     res.json({
       reply: answer,
@@ -158,7 +175,7 @@ app.post("/chat", async (req, res) => {
         score: t.score,
         text: t.text,
       })),
-      images,
+      images: [],
     });
   } catch (err) {
     console.error("❌ Chat error:", err);
@@ -180,15 +197,45 @@ app.get("/chat", async (req, res) => {
   }
 
   try {
-    const wantsImage = /image|diagram|picture|visual|figure/i.test(userQuery);
+    const wantsImage = /image|diagram|picture|visual|figure|screenshot|photo|illustration|chart|graph|drawing/i.test(userQuery);
     const topResults = await retrieveTopK(userQuery, 3);
     const KB_THRESHOLD = 0.05;
 
     let contextText = "";
     if (topResults[0]?.score >= KB_THRESHOLD) {
-      contextText = topResults.map(c => c.text).join("\n---\n");
+      contextText = await summarizeContext(topResults);
     }
 
+    if (wantsImage) {
+      const wordCount = userQuery.split(/\s+/).length;
+      const isGenericRequest = /(show|see|give).*(image|picture|diagram)/i.test(userQuery) && wordCount <= 4;
+      if (isGenericRequest) {
+        res.write(`data: ${JSON.stringify({ token: "I'd be happy to show you images! Could you be more specific?" })}\n\n`);
+        res.write("data: [DONE]\n\n");
+        res.end();
+        return;
+      }
+
+      if (topResults[0]?.score >= KB_THRESHOLD) {
+        const images = topResults.flatMap(r =>
+          r.images.map(img => ({ filename: img.filename, url: img.url.replace(/^\/uploads\/images/, "/images"), width: img.width, height: img.height }))
+        );
+        if (images.length > 0) {
+          res.write(`data: ${JSON.stringify({ token: `I found ${images.length} relevant image(s) for "${userQuery}"` })}\n\n`);
+          res.write(`data: ${JSON.stringify({ images })}\n\n`);
+          res.write("data: [DONE]\n\n");
+          res.end();
+          return;
+        }
+      }
+
+      res.write(`data: ${JSON.stringify({ token: "Couldn't find any relevant images." })}\n\n`);
+      res.write("data: [DONE]\n\n");
+      res.end();
+      return;
+    }
+
+    // Normal text streaming
     const chatRes = await fetch("https://openrouter.ai/api/v1/chat/completions", {
       method: "POST",
       headers: {
@@ -199,8 +246,8 @@ app.get("/chat", async (req, res) => {
         model: "openai/gpt-oss-20b:free",
         stream: true,
         messages: [
-          { role: "system", content: "You are a helpful assistant." },
-          { role: "user", content: `Context:\n${contextText}\n\nQuestion:\n${userQuery}` },
+          { role: "system", content: "You are a helpful assistant. Give concise answers." },
+          { role: "user", content: `Summary:\n${contextText}\n\nQuestion:\n${userQuery}` },
         ],
       }),
     });
@@ -208,9 +255,6 @@ app.get("/chat", async (req, res) => {
     if (!chatRes.ok || !chatRes.body) throw new Error("Failed to connect to OpenRouter");
 
     const decoder = new TextDecoder("utf-8");
-    let botReply = "";
-
-    // Node.js ReadableStream async iteration
     for await (const chunk of chatRes.body) {
       const str = decoder.decode(chunk, { stream: true });
       const lines = str.split("\n").filter(l => l.trim().startsWith("data:"));
@@ -218,31 +262,13 @@ app.get("/chat", async (req, res) => {
       for (const line of lines) {
         const payload = line.replace(/^data:\s*/, "");
         if (payload === "[DONE]") continue;
-
         try {
           const data = JSON.parse(payload);
           const token = data.choices?.[0]?.delta?.content;
-          if (token) {
-            botReply += token;
-            res.write(`data: ${JSON.stringify({ token })}\n\n`);
-          }
+          if (token) res.write(`data: ${JSON.stringify({ token })}\n\n`);
         } catch {
           console.warn("Non-JSON SSE chunk:", payload);
         }
-      }
-    }
-
-    if (wantsImage) {
-      const images = topResults.flatMap(r =>
-        r.images.map(img => ({
-          filename: img.filename,
-          url: img.url,
-          width: img.width,
-          height: img.height,
-        }))
-      );
-      if (images.length > 0) {
-        res.write(`data: ${JSON.stringify({ images })}\n\n`);
       }
     }
 
@@ -254,6 +280,5 @@ app.get("/chat", async (req, res) => {
     res.end();
   }
 });
-
 
 app.listen(PORT, () => console.log(`🚀 Server running at http://localhost:${PORT}`));
