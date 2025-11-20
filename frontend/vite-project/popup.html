@@ -1,0 +1,27 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <style>
+    body { width: 200px; padding: 15px; text-align: center; }
+    button { 
+      background: #2563eb; color: white; border: none; 
+      padding: 10px 15px; border-radius: 8px; cursor: pointer; 
+    }
+  </style>
+</head>
+<body>
+  <button id="toggleBubble">Afficher la bulle</button>
+  
+  <script>
+    document.getElementById('toggleBubble').addEventListener('click', () => {
+      // Envoie un message à tous les sites web ouverts
+      chrome.tabs.query({}, (tabs) => {
+        tabs.forEach(tab => {
+          chrome.tabs.sendMessage(tab.id, { action: "toggleBubble" });
+        });
+      });
+      window.close(); // Ferme le popup
+    });
+  </script>
+</body>
+</html>

@@ -1,8 +1,16 @@
 {
   "manifest_version": 3,
-  "name": "Chatbot Extension",
+  "name": "ChromeAI Assistant",
   "version": "1.0",
-  "action": { "default_popup": "index.html" },
+  "action": { 
+    "default_popup": "popup.html" 
+  },
+  "permissions": ["storage"],
+  "host_permissions": [
+    "http://localhost:3000/*",
+    "http://127.0.0.1:3000/*",
+    "http://localhost:5001/*"
+  ],
   "content_scripts": [
     {
       "matches": ["<all_urls>"],
@@ -12,9 +20,8 @@
   ],
   "web_accessible_resources": [
     {
-      "resources": ["index.html", "main.js", "styles.css"],
+      "resources": ["index.html", "index.js", "inject.js", "assets/*"],
       "matches": ["<all_urls>"]
     }
-  ],
-  "permissions": ["storage"]
+  ]
 }

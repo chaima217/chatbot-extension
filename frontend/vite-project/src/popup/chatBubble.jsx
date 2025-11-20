@@ -62,7 +62,7 @@ export default function ChatBubble() {
               alignItems: "center",
             }}
           >
-            <span>Chatbot</span>
+            <span>ChromeAI Assistant</span>
             <button
               onClick={() => setOpen(false)}
               style={{

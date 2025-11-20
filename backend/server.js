@@ -11,7 +11,7 @@ dotenv.config();
 
 const PORT = process.env.PORT || 3000;
 const KB_PATH = process.env.KB_PATH || "./output.json";
-const OPENROUTER_KEY = process.env.OPENROUTER_API_KEY;
+const OPENROUTER_KEY = process.env.OPENROUTER_API_KEY || "";
 
 const app = express();
 app.use(cors());
@@ -54,6 +54,14 @@ function cosineSimilarity(a, b) {
   return dot / (Math.sqrt(na) * Math.sqrt(nb) || 1e-10);
 }
 
+// -------------------- Response validation --------------------
+function isGoodResponse(text) {
+  // Check for word repetition (like "Entschuldigung, Entschuldigung")
+  const words = text.split(' ');
+  const uniqueWords = new Set(words);
+  return (uniqueWords.size / words.length) > 0.6;
+}
+
 // -------------------- Retrieve Top K --------------------
 async function retrieveTopK(query, k = 3) {
   const qEmb = await getQueryEmbedding(query);
@@ -64,13 +72,21 @@ async function retrieveTopK(query, k = 3) {
     
     let relevantImages = [];
     if (kbPage?.images && kbPage.images.length > 0) {
-      relevantImages = kbPage.images.filter(img => {
-        if (!img.embedding || img.embedding.length === 0) return false;
-        const imgEmb = img.embedding;
-        const sim = cosineSimilarity(qEmb, imgEmb);
-        if (sim > 0.1) console.log(`📸 Image "${img.filename}" similarity: ${sim.toFixed(4)}`);
-        return sim > 0.15;
-      });
+      const wantsImage = /image|diagram|picture|visual|figure|screenshot|photo|illustration|chart|graph|drawing/i.test(query);
+      
+      if (wantsImage) {
+        relevantImages = kbPage.images.filter(img => {
+          if (!img.embedding || img.embedding.length === 0) return false;
+          const sim = cosineSimilarity(qEmb, img.embedding);
+          console.log(`🔍 Image "${img.filename}" similarity: ${sim.toFixed(4)}`);
+          return sim > 0.1;
+        });
+        
+        if (relevantImages.length === 0 && r.score > 0.3) {
+          console.log(`📄 Including all images from page ${r.page_number} (high text match)`);
+          relevantImages = kbPage.images;
+        }
+      }
     }
 
     return {
@@ -80,27 +96,59 @@ async function retrieveTopK(query, k = 3) {
   });
 }
 
-// -------------------- Helper: Summarize KB --------------------
-async function summarizeContext(topResults) {
-  const texts = topResults.map(c => c.text).join("\n---\n");
-  const res = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+async function queryHuggingFace(messages) {
+  const userMessage = messages[messages.length - 1].content;
+  
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 60000); // 60s
+  try{
+  const response = await fetch("https://api-inference.huggingface.co/models/microsoft/DialoGPT-medium", {
     method: "POST",
     headers: {
-      Authorization: `Bearer ${OPENROUTER_KEY}`,
+      "Authorization": `Bearer ${process.env.HUGGINGFACE_API_KEY}`,
       "Content-Type": "application/json",
     },
     body: JSON.stringify({
-      model: "openai/gpt-oss-20b:free",
-      messages: [
-        { role: "system", content: "You are a helpful assistant. Summarize the following content concisely for answering a question." },
-        { role: "user", content: texts }
-      ],
-    }),
+      inputs: userMessage,
+      parameters: { max_new_tokens: 100 }
+    })
   });
-  const data = await res.json();
-  return data.choices?.[0]?.message?.content || texts;
+
+  if (!response.ok) throw new Error(`Hugging Face error: ${response.status}`);
+  return response;
+  } catch (error) {
+    clearTimeout(timeoutId);
+    throw error;
+  }
 }
 
+/*
+// -------------------- OpenRouter API Helper --------------------
+async function queryOpenRouter(messages) {
+  const response = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+    method: "POST",
+    headers: {
+      "Authorization": `Bearer ${OPENROUTER_KEY}`,
+      "Content-Type": "application/json",
+      "HTTP-Referer": "http://localhost:3000", // Add this
+      "X-Title": "Chatbot" // Add this
+    },
+    body: JSON.stringify({
+      model: "google/gemma-2-2b-it:free",
+      messages: messages,
+      max_tokens: 300,
+      temperature: 0.7,
+    })
+  });
+
+  if (!response.ok) {
+    const error = await response.text();
+    throw new Error(`OpenRouter API error: ${error}`);
+  }
+
+  return response;
+}
+*/
 // -------------------- Chat endpoint (POST) --------------------
 app.post("/chat", async (req, res) => {
   try {
@@ -113,67 +161,121 @@ app.post("/chat", async (req, res) => {
 
     let answer = "Sorry, I can't help with that.";
     let topResults = [];
+    
 
     if (isSmallTalk) {
       const greetings = ["Hey! 👋","Hello! 😊","Hi there!","Hey, how's it going?","Hi! Hope you're doing well!"];
       answer = greetings[Math.floor(Math.random() * greetings.length)];
-    } else {
-      topResults = await retrieveTopK(userQuery, 3);
-      const KB_THRESHOLD = 0.05;
+      res.json({ reply: answer, query: userQuery, images: [], top_results: [] });
+      return;
+    }
 
-      if (wantsImage) {
-        const wordCount = userQuery.split(/\s+/).length;
-        const isGenericRequest = /(show|see|give).*(image|picture|diagram)/i.test(userQuery) && wordCount <= 4;
-        if (isGenericRequest) {
-          answer = "I'd be happy to show you images! Could you be more specific?";
-          res.json({ reply: answer, query: userQuery, images: [], top_results: [] });
-          return;
-        }
+    const startTime = Date.now();
+    topResults = await retrieveTopK(userQuery, 2);
+    console.log(`⏱️ Retrieval took: ${Date.now() - startTime}ms`);
 
-        if (topResults[0]?.score >= KB_THRESHOLD) {
-          const allImages = topResults.flatMap(r =>
-            r.images.map(img => ({ filename: img.filename, url: img.url.replace(/^\/uploads\/images/, "/images"), width: img.width, height: img.height }))
-          );
-          if (allImages.length > 0) {
-            answer = `I found ${allImages.length} relevant image(s) for "${userQuery}"`;
-            res.json({ reply: answer, query: userQuery, images: allImages });
-            return;
-          }
-        }
+    const KB_THRESHOLD = 0.05;
 
-        answer = "Couldn't find any relevant images in the knowledge base.";
-        res.json({ reply: answer, query: userQuery, images: [] });
+    // Handle image requests
+    if (wantsImage) {
+      const wordCount = userQuery.split(/\s+/).length;
+      const isGenericRequest = /(show|see|give).*(image|picture|diagram)/i.test(userQuery) && wordCount <= 4;
+      
+      if (isGenericRequest) {
+        answer = "I'd be happy to show you images! Could you be more specific?";
+        res.json({ reply: answer, query: userQuery, images: [], top_results: [] });
         return;
       }
 
-      if (topResults[0]?.score >= KB_THRESHOLD) {
-        const summaryText = await summarizeContext(topResults);
-        const chatRes = await fetch("https://openrouter.ai/api/v1/chat/completions", {
-          method: "POST",
-          headers: {
-            Authorization: `Bearer ${OPENROUTER_KEY}`,
-            "Content-Type": "application/json",
-          },
-          body: JSON.stringify({
-            model: "openai/gpt-oss-20b:free",
-            messages: [
-              { role: "system", content: "You are a helpful assistant. Give concise answers." },
-              { role: "user", content: `Summary:\n${summaryText}\n\nQuestion:\n${userQuery}` },
-            ],
-          }),
+      if (topResults.length > 0 && topResults[0]?.score >= KB_THRESHOLD) {
+        const allImages = topResults.flatMap(r => {
+          if (!r.images || r.images.length === 0) return [];
+          
+          return r.images.map(img => {
+            let imageUrl = img.url || `/images/${img.filename}`;
+            if (imageUrl.startsWith('/uploads/images')) {
+              imageUrl = imageUrl.replace('/uploads/images', '/images');
+            }
+            if (!imageUrl.startsWith('/images/') && !imageUrl.startsWith('http')) {
+              imageUrl = `/images/${img.filename}`;
+            }
+            
+            return { 
+              filename: img.filename,
+              url: imageUrl,
+              width: img.width || 800,
+              height: img.height || 600,
+              relevance: r.score
+            };
+          });
         });
-        const chatData = await chatRes.json();
-        answer = chatData.choices?.[0]?.message?.content || answer;
+        
+        console.log(`🖼️ Found ${allImages.length} images:`, allImages.map(i => i.url));
+        
+        if (allImages.length > 0) {
+          answer = `Here ${allImages.length === 1 ? 'is' : 'are'} ${allImages.length} relevant image${allImages.length > 1 ? 's' : ''}:`;
+          res.json({ 
+            reply: answer, 
+            query: userQuery, 
+            images: allImages,
+            hasImages: true 
+          });
+          return;
+        }
       }
+
+      answer = "I couldn't find any relevant images for that query in my knowledge base.";
+      res.json({ reply: answer, query: userQuery, images: [], hasImages: false });
+      return;
     }
+
+    // Handle text queries with OpenRouter
+    if (topResults[0]?.score >= KB_THRESHOLD) {
+      const contextText = topResults
+        .slice(0, 2)
+        .map(r => r.text.slice(0, 1500))
+        .join("\n---\n");
+
+      const apiStart = Date.now();
+      
+      try {
+        const hfResponse = await queryHuggingFace([
+          { 
+            role: "system", 
+            content: "You are a helpful assistant. Answer concisely based on the provided context. If the context doesn't contain the answer, say so briefly." 
+          },
+          { 
+            role: "user", 
+            content: `Context:\n${contextText}\n\nQuestion: ${userQuery}\n\nAnswer concisely:` 
+          }
+        ]);
+        
+        const data = await hfResponse.json();
+        answer = data[0]?.generated_text || "I couldn't generate a response.";
+        
+        answer = data.choices?.[0]?.message?.content || "I couldn't generate a response.";
+        if (!isGoodResponse(answer)) {
+          console.log("⚠️ Detected low-quality response, replacing with fallback message.");
+          answer = "I couldn't find relevant information in my knowledge base to answer that question.";
+        }
+        
+      } catch (error) {
+        console.error("OpenRouter error:", error);
+        answer = "Sorry, the AI service is currently unavailable. Please try again.";
+      }
+    } else {
+      answer = "I couldn't find relevant information in my knowledge base to answer that question.";
+    }
+
+    console.log(`⏱️ Total time: ${Date.now() - startTime}ms`);
 
     res.json({
       reply: answer,
       query: userQuery,
       top_results: topResults.map(t => ({
         id: t.page_number,
-        score: t.score,
-        text: t.text,
+        score: t.score.toFixed(3),
+        text: t.text.slice(0, 200) + "..."
       })),
       images: [],
     });
@@ -198,17 +300,14 @@ app.get("/chat", async (req, res) => {
 
   try {
     const wantsImage = /image|diagram|picture|visual|figure|screenshot|photo|illustration|chart|graph|drawing/i.test(userQuery);
-    const topResults = await retrieveTopK(userQuery, 3);
+    const topResults = await retrieveTopK(userQuery, 2);
     const KB_THRESHOLD = 0.05;
 
-    let contextText = "";
-    if (topResults[0]?.score >= KB_THRESHOLD) {
-      contextText = await summarizeContext(topResults);
-    }
-
+    // Handle image requests
     if (wantsImage) {
       const wordCount = userQuery.split(/\s+/).length;
       const isGenericRequest = /(show|see|give).*(image|picture|diagram)/i.test(userQuery) && wordCount <= 4;
+      
       if (isGenericRequest) {
         res.write(`data: ${JSON.stringify({ token: "I'd be happy to show you images! Could you be more specific?" })}\n\n`);
         res.write("data: [DONE]\n\n");
@@ -216,60 +315,84 @@ app.get("/chat", async (req, res) => {
         return;
       }
 
-      if (topResults[0]?.score >= KB_THRESHOLD) {
-        const images = topResults.flatMap(r =>
-          r.images.map(img => ({ filename: img.filename, url: img.url.replace(/^\/uploads\/images/, "/images"), width: img.width, height: img.height }))
-        );
+      if (topResults.length > 0 && topResults[0]?.score >= KB_THRESHOLD) {
+        const images = topResults.flatMap(r => {
+          if (!r.images || r.images.length === 0) return [];
+          
+          return r.images.map(img => {
+            let imageUrl = img.url || `/images/${img.filename}`;
+            if (imageUrl.startsWith('/uploads/images')) {
+              imageUrl = imageUrl.replace('/uploads/images', '/images');
+            }
+            if (!imageUrl.startsWith('/images/') && !imageUrl.startsWith('http')) {
+              imageUrl = `/images/${img.filename}`;
+            }
+            
+            return { 
+              filename: img.filename,
+              url: imageUrl,
+              width: img.width || 800,
+              height: img.height || 600,
+              relevance: r.score
+            };
+          });
+        });
+        
+        console.log(`🖼️ Streaming ${images.length} images`);
+        
         if (images.length > 0) {
-          res.write(`data: ${JSON.stringify({ token: `I found ${images.length} relevant image(s) for "${userQuery}"` })}\n\n`);
-          res.write(`data: ${JSON.stringify({ images })}\n\n`);
+          res.write(`data: ${JSON.stringify({ 
+            token: `Here ${images.length === 1 ? 'is' : 'are'} ${images.length} relevant image${images.length > 1 ? 's' : ''}:` 
+          })}\n\n`);
+          res.write(`data: ${JSON.stringify({ images, hasImages: true })}\n\n`);
           res.write("data: [DONE]\n\n");
           res.end();
           return;
         }
       }
 
-      res.write(`data: ${JSON.stringify({ token: "Couldn't find any relevant images." })}\n\n`);
+      res.write(`data: ${JSON.stringify({ token: "I couldn't find any relevant images for that query." })}\n\n`);
       res.write("data: [DONE]\n\n");
       res.end();
       return;
     }
 
-    // Normal text streaming
-    const chatRes = await fetch("https://openrouter.ai/api/v1/chat/completions", {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${OPENROUTER_KEY}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        model: "openai/gpt-oss-20b:free",
-        stream: true,
-        messages: [
-          { role: "system", content: "You are a helpful assistant. Give concise answers." },
-          { role: "user", content: `Summary:\n${contextText}\n\nQuestion:\n${userQuery}` },
-        ],
-      }),
-    });
+    // Text streaming with OpenRouter
+    let contextText = "";
+    if (topResults[0]?.score >= KB_THRESHOLD) {
+      contextText = topResults
+        .slice(0, 2)
+        .map(r => r.text.slice(0, 1500))
+        .join("\n---\n");
+    }
 
-    if (!chatRes.ok || !chatRes.body) throw new Error("Failed to connect to OpenRouter");
-
-    const decoder = new TextDecoder("utf-8");
-    for await (const chunk of chatRes.body) {
-      const str = decoder.decode(chunk, { stream: true });
-      const lines = str.split("\n").filter(l => l.trim().startsWith("data:"));
-
-      for (const line of lines) {
-        const payload = line.replace(/^data:\s*/, "");
-        if (payload === "[DONE]") continue;
-        try {
-          const data = JSON.parse(payload);
-          const token = data.choices?.[0]?.delta?.content;
-          if (token) res.write(`data: ${JSON.stringify({ token })}\n\n`);
-        } catch {
-          console.warn("Non-JSON SSE chunk:", payload);
+    try {
+      const hfResponse = await queryHuggingFace([
+        { 
+          role: "system", 
+          content: "You are a helpful assistant. Answer concisely based on the provided context." 
+        },
+        { 
+          role: "user", 
+          content: contextText 
+            ? `Context:\n${contextText}\n\nQuestion: ${userQuery}\n\nAnswer:` 
+            : userQuery
         }
+      ]);
+
+      const data = await hfResponse.json();
+      answer = data[0]?.generated_text || "I couldn't generate a response.";
+      
+      // Stream the response word by word for better UX
+      const words = answer.split(' ');
+      for (const word of words) {
+        res.write(`data: ${JSON.stringify({ token: word + ' ' })}\n\n`);
+        await new Promise(resolve => setTimeout(resolve, 50));
       }
+
+    } catch (error) {
+      console.error("OpenRouter streaming error:", error);
+      res.write(`data: ${JSON.stringify({ token: "Sorry, the AI service is currently unavailable." })}\n\n`);
     }
 
     res.write("data: [DONE]\n\n");
@@ -279,6 +402,14 @@ app.get("/chat", async (req, res) => {
     res.write(`data: ${JSON.stringify({ error: err.message })}\n\n`);
     res.end();
   }
+});
+// -------------------- Health Check --------------------
+app.get("/health", (req, res) => {
+  res.json({ 
+    status: "healthy", 
+    kb_entries: kb.length,
+    timestamp: new Date().toISOString()
+  });
 });
 
 app.listen(PORT, () => console.log(`🚀 Server running at http://localhost:${PORT}`));
