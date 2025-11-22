@@ -230,6 +230,7 @@ app.post("/chat", async (req, res) => {
     }
 
     // Handle text queries with OpenRouter
+    /*
     if (topResults[0]?.score >= KB_THRESHOLD) {
       const contextText = topResults
         .slice(0, 2)
@@ -266,7 +267,14 @@ app.post("/chat", async (req, res) => {
     } else {
       answer = "I couldn't find relevant information in my knowledge base to answer that question.";
     }
-
+*/
+      // Handle text queries - SIMPLE MODE WITHOUT API
+    if (topResults[0]?.score >= KB_THRESHOLD) {
+      const bestMatch = topResults[0];
+      answer = `I found relevant information from page ${bestMatch.page_number}:\n\n"${bestMatch.text.slice(0, 400)}..."`;
+    } else {
+      answer = "I couldn't find relevant information in my knowledge base to answer that question.";
+    }
     console.log(`⏱️ Total time: ${Date.now() - startTime}ms`);
 
     res.json({
@@ -286,6 +294,7 @@ app.post("/chat", async (req, res) => {
 });
 
 // -------------------- Chat endpoint (GET SSE streaming) --------------------
+// -------------------- Chat endpoint (GET SSE streaming) --------------------
 app.get("/chat", async (req, res) => {
   res.setHeader("Content-Type", "text/event-stream");
   res.setHeader("Cache-Control", "no-cache");
@@ -294,8 +303,19 @@ app.get("/chat", async (req, res) => {
   const userQuery = req.query.q?.trim();
   if (!userQuery) {
     res.write(`data: ${JSON.stringify({ error: "message required" })}\n\n`);
-    res.end();
-    return;
+    res.write("data: [DONE]\n\n");
+    return res.end();
+  }
+
+  // --- Small talk handling ---
+  const smallTalkRegex = /\b(hi|hello|hey|how are you|good morning|good afternoon|good evening)\b/i;
+  if (smallTalkRegex.test(userQuery)) {
+    const greetings = ["Hey! 👋","Hello! 😊","Hi there!","Hey, how's it going?","Hi! Hope you're doing well!"];
+    const answer = greetings[Math.floor(Math.random() * greetings.length)];
+
+    res.write(`data: ${JSON.stringify({ token: answer })}\n\n`);
+    res.write("data: [DONE]\n\n");
+    return res.end();
   }
 
   try {
@@ -303,31 +323,26 @@ app.get("/chat", async (req, res) => {
     const topResults = await retrieveTopK(userQuery, 2);
     const KB_THRESHOLD = 0.05;
 
-    // Handle image requests
+    // --- Image queries ---
     if (wantsImage) {
       const wordCount = userQuery.split(/\s+/).length;
       const isGenericRequest = /(show|see|give).*(image|picture|diagram)/i.test(userQuery) && wordCount <= 4;
-      
+
       if (isGenericRequest) {
         res.write(`data: ${JSON.stringify({ token: "I'd be happy to show you images! Could you be more specific?" })}\n\n`);
         res.write("data: [DONE]\n\n");
-        res.end();
-        return;
+        return res.end();
       }
 
       if (topResults.length > 0 && topResults[0]?.score >= KB_THRESHOLD) {
         const images = topResults.flatMap(r => {
           if (!r.images || r.images.length === 0) return [];
-          
+
           return r.images.map(img => {
             let imageUrl = img.url || `/images/${img.filename}`;
-            if (imageUrl.startsWith('/uploads/images')) {
-              imageUrl = imageUrl.replace('/uploads/images', '/images');
-            }
-            if (!imageUrl.startsWith('/images/') && !imageUrl.startsWith('http')) {
-              imageUrl = `/images/${img.filename}`;
-            }
-            
+            if (imageUrl.startsWith('/uploads/images')) imageUrl = imageUrl.replace('/uploads/images', '/images');
+            if (!imageUrl.startsWith('/images/') && !imageUrl.startsWith('http')) imageUrl = `/images/${img.filename}`;
+
             return { 
               filename: img.filename,
               url: imageUrl,
@@ -337,70 +352,77 @@ app.get("/chat", async (req, res) => {
             };
           });
         });
-        
-        console.log(`🖼️ Streaming ${images.length} images`);
-        
+
         if (images.length > 0) {
-          res.write(`data: ${JSON.stringify({ 
-            token: `Here ${images.length === 1 ? 'is' : 'are'} ${images.length} relevant image${images.length > 1 ? 's' : ''}:` 
-          })}\n\n`);
+          res.write(`data: ${JSON.stringify({ token: `Here ${images.length === 1 ? 'is' : 'are'} ${images.length} relevant image${images.length > 1 ? 's' : ''}:` })}\n\n`);
           res.write(`data: ${JSON.stringify({ images, hasImages: true })}\n\n`);
           res.write("data: [DONE]\n\n");
-          res.end();
-          return;
+          return res.end();
         }
       }
 
       res.write(`data: ${JSON.stringify({ token: "I couldn't find any relevant images for that query." })}\n\n`);
       res.write("data: [DONE]\n\n");
-      res.end();
-      return;
+      return res.end();
     }
 
-    // Text streaming with OpenRouter
-    let contextText = "";
-    if (topResults[0]?.score >= KB_THRESHOLD) {
-      contextText = topResults
-        .slice(0, 2)
-        .map(r => r.text.slice(0, 1500))
-        .join("\n---\n");
+    // --- Text queries ---
+    let answer = "";
+    if (topResults.length > 0 && topResults[0]?.score >= KB_THRESHOLD) {
+      const bestMatch = topResults[0];
+      answer = `I found relevant information from page ${bestMatch.page_number}: "${bestMatch.text.slice(0, 300)}..."`;
+    } else {
+      answer = "I couldn't find relevant information in my knowledge base for that question.";
     }
 
-    try {
-      const hfResponse = await queryHuggingFace([
-        { 
-          role: "system", 
-          content: "You are a helpful assistant. Answer concisely based on the provided context." 
-        },
-        { 
-          role: "user", 
-          content: contextText 
-            ? `Context:\n${contextText}\n\nQuestion: ${userQuery}\n\nAnswer:` 
-            : userQuery
-        }
-      ]);
-
-      const data = await hfResponse.json();
-      answer = data[0]?.generated_text || "I couldn't generate a response.";
-      
-      // Stream the response word by word for better UX
-      const words = answer.split(' ');
-      for (const word of words) {
-        res.write(`data: ${JSON.stringify({ token: word + ' ' })}\n\n`);
-        await new Promise(resolve => setTimeout(resolve, 50));
-      }
-
-    } catch (error) {
-      console.error("OpenRouter streaming error:", error);
-      res.write(`data: ${JSON.stringify({ token: "Sorry, the AI service is currently unavailable." })}\n\n`);
+    // Stream answer word by word for better frontend UX
+    const words = answer.split(' ');
+    for (const word of words) {
+      res.write(`data: ${JSON.stringify({ token: word + ' ' })}\n\n`);
+      await new Promise(resolve => setTimeout(resolve, 30)); // 30ms between words
     }
 
     res.write("data: [DONE]\n\n");
     res.end();
+
   } catch (err) {
     console.error("❌ Streaming error:", err);
-    res.write(`data: ${JSON.stringify({ error: err.message })}\n\n`);
+    res.write(`data: ${JSON.stringify({ token: "Sorry, an error occurred." })}\n\n`);
+    res.write("data: [DONE]\n\n");
     res.end();
+  }
+});
+// Sauvegarder l'historique
+app.post("/chat/history", async (req, res) => {
+  try {
+    const { user_id, query, response } = req.body;
+    
+    // Appelle ton API Python pour sauvegarder
+    const saveResponse = await fetch("http://localhost:5001/save_history", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ user_id, query, response })
+    });
+    
+    res.json({ success: true });
+  } catch (err) {
+    console.error("History save error:", err);
+    res.status(500).json({ error: "Failed to save history" });
+  }
+});
+
+// Récupérer l'historique
+app.get("/chat/history/:user_id", async (req, res) => {
+  try {
+    const { user_id } = req.params;
+    
+    const historyResponse = await fetch(`http://localhost:5001/get_history/${user_id}`);
+    const history = await historyResponse.json();
+    
+    res.json(history);
+  } catch (err) {
+    console.error("History fetch error:", err);
+    res.status(500).json({ error: "Failed to fetch history" });
   }
 });
 // -------------------- Health Check --------------------

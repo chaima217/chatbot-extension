@@ -4,7 +4,9 @@ from flask_cors import CORS
 from sentence_transformers import SentenceTransformer, util
 import logging
 import threading
+from functools import lru_cache
 import hashlib
+
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -256,6 +258,16 @@ def cache_stats():
             "max_size": MAX_CACHE_SIZE,
             "hit_rate": "N/A"  # Would need request counter to calculate
         })
+""" @app.route("/save_history", methods=["POST"])
+    def save_history():
+        data = request.get_json()
+        save_query(data['user_id'], data['query'], data['response'])
+        return jsonify({"status": "saved"})
+
+    @app.route("/get_history/<user_id>", methods=["GET"])
+    def get_history(user_id):
+        history = get_user_history(user_id)
+        return jsonify(history)"""
 
 if __name__ == "__main__":
     print("🚀 Optimized Embedding Server on http://127.0.0.1:5001")
@@ -267,7 +279,8 @@ if __name__ == "__main__":
     print("   POST /cache/clear   - Clear cache")
     print("   GET  /cache/stats   - Cache statistics")
     print(f"💾 Cache size limit: {MAX_CACHE_SIZE} embeddings")
-    
+
+
     # Use production server for better performance
     try:
         from waitress import serve
@@ -275,3 +288,4 @@ if __name__ == "__main__":
     except ImportError:
         logger.warning("⚠️ Waitress not installed, using Flask dev server")
         app.run(host="127.0.0.1", port=5001, threaded=True)
+    

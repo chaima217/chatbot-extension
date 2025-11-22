@@ -4,6 +4,6 @@ import ChatBubble from "./chatBubble.jsx";
 
 createRoot(document.getElementById("root")).render(
   <React.StrictMode>
-    <App />
+    <ChatBubble />
   </React.StrictMode>
 );

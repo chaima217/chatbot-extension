@@ -10,7 +10,7 @@ export default defineConfig({
       // We build the popup (index.html) and the content script (inject.js)
       input: {
         index: resolve(__dirname, 'index.html'),
-        inject: resolve(__dirname, 'src/content/inject.js')
+        inject: resolve(__dirname, 'public/inject.js')
       },
       // predictable output file names (no hashes)
       output: {
